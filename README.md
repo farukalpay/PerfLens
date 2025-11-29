@@ -49,4 +49,4 @@ On launch, PerfLens opens a realistic demo session (JSON parsing, image-like arr
 - Tooltips include glossary entries for profiling metrics if you need a quick refresher.
 
 ## License
-MIT License. See [LICENSE](LICENSE) for details.
+Apache-2.0 License. See [LICENSE](LICENSE) for details.
