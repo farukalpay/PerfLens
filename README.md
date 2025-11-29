@@ -52,7 +52,7 @@ On launch, PerfLens opens a realistic demo session (JSON parsing, image-like arr
 Apache-2.0 License. See [LICENSE](LICENSE) for details.
 
 ## Diary
-Built on day 10 of quitting weed in Istanbul.
+Built on day 8 of quitting weed in Istanbul.
 Dopamine system crashed. Anhedonia at peak.
 Built this to prove I could still make things.
 If you found this in 2035, hope it helps.
