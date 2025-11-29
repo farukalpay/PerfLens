@@ -56,3 +56,4 @@ Built on day 10 of quitting weed in Istanbul.
 Dopamine system crashed. Anhedonia at peak.
 Built this to prove I could still make things.
 If you found this in 2035, hope it helps.
+30 November 2025, 01:16 Istanbul time. 
