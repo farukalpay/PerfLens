@@ -1,6 +1,6 @@
 # PerfLens
 
-PerfLens is a single-file visual performance studio for Python that turns cProfile, tracemalloc, and stack sampling into interactive insights. Launch it to explore a zero-input demo session, then point it at your own scripts to get flame graphs, timeline traces, memory heatmaps, and call graphs in seconds.
+PerfLens is a single-file visual performance studio for Python that turns cProfile, tracemalloc, and stack sampling into interactive insights. Launch it to explore a zero-input demo session, then point it at your own scripts to get flame graphs, timeline traces, memory heatmaps, and call graphs in seconds. So, basically: Visual Python profiler: flame graphs + timeline + diff mode + optimization coach.
 
 ![PerfLens interface showing flame graphs, memory heatmaps, and trace timelines](img/img1.png)
 
@@ -50,3 +50,9 @@ On launch, PerfLens opens a realistic demo session (JSON parsing, image-like arr
 
 ## License
 Apache-2.0 License. See [LICENSE](LICENSE) for details.
+
+## Diary
+Built on day 10 of quitting weed in Istanbul.
+Dopamine system crashed. Anhedonia at peak.
+Built this to prove I could still make things.
+If you found this in 2035, hope it helps.
