@@ -38,6 +38,7 @@ import threading
 import time
 import traceback
 import types
+import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
@@ -611,14 +612,57 @@ class RenderThrottle:
     """Coalesce frequent update() calls into ~60Hz (or lower) to keep UI snappy."""
     def __init__(self, widget: QWidget, hz: int = 60) -> None:
         self.widget = widget
+        self._widget_ref = weakref.ref(widget)
         self.timer = QTimer(widget)
         self.timer.setSingleShot(True)
-        self.timer.timeout.connect(widget.update)
+        self.timer.timeout.connect(self._maybe_update)
         self.interval_ms = max(8, int(1000 / max(10, hz)))
+        self._alive = True
+        widget.destroyed.connect(self.dispose)
 
     def poke(self) -> None:
+        widget = self._widget_ref()
+        if not self._alive or not widget:
+            return
+        if not self._window_ready(widget):
+            return
         if not self.timer.isActive():
             self.timer.start(self.interval_ms)
+
+    def _maybe_update(self) -> None:
+        if not self._alive:
+            return
+        widget = self._widget_ref()
+        if not widget or not self._window_ready(widget):
+            return
+        widget.update()
+
+    def _window_ready(self, widget: QWidget) -> bool:
+        if not self._alive:
+            return False
+        try:
+            win = widget.window()
+        except RuntimeError:
+            return False
+        if not win:
+            return False
+        try:
+            handle = win.windowHandle()
+        except RuntimeError:
+            return False
+        return handle is not None
+
+    def dispose(self, *_args) -> None:
+        self._alive = False
+        timer = getattr(self, "timer", None)
+        if timer is None:
+            return
+        try:
+            if timer.isActive():
+                timer.stop()
+            timer.deleteLater()
+        except RuntimeError:
+            pass
 
 
 # -------------------------- Flame Graph (Sampling) --------------------------
@@ -794,85 +838,92 @@ class FlameGraphWidget(QWidget):
         if self._layout_dirty:
             self._compute_layout()
 
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing, True)
-        p.fillRect(self.rect(), _qcolor(self.theme["panel2"]))
-
-        if not self.root:
-            p.setPen(_qcolor(self.theme["muted"]))
-            p.setFont(QFont("Segoe UI", 10))
-            p.drawText(self.rect(), Qt.AlignCenter, "No flame graph yet")
+        painter = QPainter()
+        if not painter.begin(self):
             return
+        has_root = self.root is not None
+        try:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            painter.fillRect(self.rect(), _qcolor(self.theme["panel2"]))
 
-        p.translate(self.pan)
-
-        font = QFont("Segoe UI", 9)
-        p.setFont(font)
-        fm = QFontMetrics(font)
-
-        # slight gradient background grid
-        p.setPen(QPen(_qcolor(self.theme["grid"]), 1))
-        for y in range(0, int((self.height() - self.pan.y()) / self.row_h) + 3):
-            yy = y * self.row_h
-            p.drawLine(0, yy, int(self.width() * self.zoom), yy)
-
-        for key, rect, node, depth in self._layout:
-            # cull
-            if rect.right() + self.pan.x() < -40 or rect.left() + self.pan.x() > self.width() + 40:
-                continue
-            if rect.bottom() + self.pan.y() < -40 or rect.top() + self.pan.y() > self.height() + 40:
-                continue
-
-            # color
-            if self.diff_mode:
-                c = self._diff_color(key, node)
+            if not has_root:
+                painter.setPen(_qcolor(self.theme["muted"]))
+                painter.setFont(QFont("Segoe UI", 10))
+                painter.drawText(self.rect(), Qt.AlignCenter, "No flame graph yet")
             else:
-                c = self._heat_color(node)
+                painter.translate(self.pan)
 
-            # highlight search
-            if self.search and self.search in node.name.lower():
-                c = _blend(c, _qcolor(self.theme["accent"]), 0.5)
+                font = QFont("Segoe UI", 9)
+                painter.setFont(font)
+                fm = QFontMetrics(font)
 
-            p.setPen(QPen(_qcolor(self.theme["stroke"]), 1))
-            p.setBrush(c)
-            radius = 4.0
-            p.drawRoundedRect(rect, radius, radius)
+                # slight gradient background grid
+                painter.setPen(QPen(_qcolor(self.theme["grid"]), 1))
+                for y in range(0, int((self.height() - self.pan.y()) / self.row_h) + 3):
+                    yy = y * self.row_h
+                    painter.drawLine(0, yy, int(self.width() * self.zoom), yy)
 
-            # selection / hover outlines
-            if key == self.selected_path:
-                p.setPen(QPen(_qcolor(self.theme["accent2"]), 2))
-                p.setBrush(Qt.NoBrush)
-                p.drawRoundedRect(rect.adjusted(1.0, 1.0, -1.0, -1.0), radius, radius)
-            elif key == self.hover_path:
-                p.setPen(QPen(_qcolor(self.theme["accent"]), 2))
-                p.setBrush(Qt.NoBrush)
-                p.drawRoundedRect(rect.adjusted(1.0, 1.0, -1.0, -1.0), radius, radius)
+                for key, rect, node, depth in self._layout:
+                    # cull
+                    if rect.right() + self.pan.x() < -40 or rect.left() + self.pan.x() > self.width() + 40:
+                        continue
+                    if rect.bottom() + self.pan.y() < -40 or rect.top() + self.pan.y() > self.height() + 40:
+                        continue
 
-            # label
-            if rect.width() >= 55:
-                label = node.name
-                maxw = rect.width() - 10
-                if fm.horizontalAdvance(label) > maxw:
-                    # elide
-                    ell = "…"
-                    while label and fm.horizontalAdvance(label + ell) > maxw:
-                        label = label[:-1]
-                    label = (label + ell) if label else ell
-                p.setPen(_qcolor(self.theme["text"]))
-                p.drawText(rect.adjusted(6, 0, -6, 0), Qt.AlignVCenter | Qt.AlignLeft, label)
+                    # color
+                    if self.diff_mode:
+                        c = self._diff_color(key, node)
+                    else:
+                        c = self._heat_color(node)
 
-        # HUD
-        p.resetTransform()
-        chip = QRectF(10, 10, 260, 26)
-        p.setPen(Qt.NoPen)
-        p.setBrush(_qcolor(self.theme["chip"]))
-        p.drawRoundedRect(chip, 10, 10)
-        p.setPen(_qcolor(self.theme["muted"]))
-        p.setFont(QFont("Segoe UI", 9))
-        info = f"Flame Graph • sampling stacks • zoom {self.zoom:.2f}x"
-        if self.diff_mode:
-            info += " • DIFF"
-        p.drawText(chip.adjusted(10, 0, -10, 0), Qt.AlignVCenter | Qt.AlignLeft, info)
+                    # highlight search
+                    if self.search and self.search in node.name.lower():
+                        c = _blend(c, _qcolor(self.theme["accent"]), 0.5)
+
+                    painter.setPen(QPen(_qcolor(self.theme["stroke"]), 1))
+                    painter.setBrush(c)
+                    radius = 4.0
+                    painter.drawRoundedRect(rect, radius, radius)
+
+                    # selection / hover outlines
+                    if key == self.selected_path:
+                        painter.setPen(QPen(_qcolor(self.theme["accent2"]), 2))
+                        painter.setBrush(Qt.NoBrush)
+                        painter.drawRoundedRect(rect.adjusted(1.0, 1.0, -1.0, -1.0), radius, radius)
+                    elif key == self.hover_path:
+                        painter.setPen(QPen(_qcolor(self.theme["accent"]), 2))
+                        painter.setBrush(Qt.NoBrush)
+                        painter.drawRoundedRect(rect.adjusted(1.0, 1.0, -1.0, -1.0), radius, radius)
+
+                    # label
+                    if rect.width() >= 55:
+                        label = node.name
+                        maxw = rect.width() - 10
+                        if fm.horizontalAdvance(label) > maxw:
+                            # elide
+                            ell = "…"
+                            while label and fm.horizontalAdvance(label + ell) > maxw:
+                                label = label[:-1]
+                            label = (label + ell) if label else ell
+                        painter.setPen(_qcolor(self.theme["text"]))
+                        painter.drawText(rect.adjusted(6, 0, -6, 0), Qt.AlignVCenter | Qt.AlignLeft, label)
+
+                # HUD
+                painter.resetTransform()
+                chip = QRectF(10, 10, 260, 26)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(_qcolor(self.theme["chip"]))
+                painter.drawRoundedRect(chip, 10, 10)
+                painter.setPen(_qcolor(self.theme["muted"]))
+                painter.setFont(QFont("Segoe UI", 9))
+                info = f"Flame Graph • sampling stacks • zoom {self.zoom:.2f}x"
+                if self.diff_mode:
+                    info += " • DIFF"
+                painter.drawText(chip.adjusted(10, 0, -10, 0), Qt.AlignVCenter | Qt.AlignLeft, info)
+        finally:
+            painter.end()
+        if not has_root:
+            return
 
         # fps
         self._fps_counter += 1
@@ -1131,81 +1182,88 @@ class TimelineWidget(QWidget):
             t += nice
 
     def paintEvent(self, e) -> None:
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing, True)
-        p.fillRect(self.rect(), _qcolor(self.theme["panel2"]))
-
-        # header
-        p.setPen(Qt.NoPen)
-        p.setBrush(_qcolor(self.theme["panel"]))
-        p.drawRect(0, 0, self.width(), self.header_h)
-        p.setPen(_qcolor(self.theme["muted"]))
-        p.setFont(QFont("Segoe UI", 9))
-        p.drawText(12, 22, "Timeline • spans over time • drag to brush/zoom • double-click to reset")
-
-        if not self.spans:
-            p.setPen(_qcolor(self.theme["muted"]))
-            p.setFont(QFont("Segoe UI", 10))
-            p.drawText(self.rect().adjusted(0, self.header_h, 0, 0), Qt.AlignCenter, "No timeline spans yet")
+        painter = QPainter()
+        if not painter.begin(self):
             return
+        has_spans = bool(self.spans)
+        try:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            painter.fillRect(self.rect(), _qcolor(self.theme["panel2"]))
 
-        self._draw_grid(p)
+            # header
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(_qcolor(self.theme["panel"]))
+            painter.drawRect(0, 0, self.width(), self.header_h)
+            painter.setPen(_qcolor(self.theme["muted"]))
+            painter.setFont(QFont("Segoe UI", 9))
+            painter.drawText(12, 22, "Timeline • spans over time • drag to brush/zoom • double-click to reset")
 
-        # draw spans with quality cap
-        # if fps low, cap to fewer spans (largest first)
-        cap = int(1800 * self._quality)
-        if cap < len(self.spans):
-            spans = sorted(self.spans, key=lambda s: s.dur, reverse=True)[:cap]
-        else:
-            spans = self.spans
+            if not has_spans:
+                painter.setPen(_qcolor(self.theme["muted"]))
+                painter.setFont(QFont("Segoe UI", 10))
+                painter.drawText(self.rect().adjusted(0, self.header_h, 0, 0), Qt.AlignCenter, "No timeline spans yet")
+            else:
+                self._draw_grid(painter)
 
-        p.setFont(QFont("Segoe UI", 8))
-        fm = QFontMetrics(p.font())
+                # draw spans with quality cap
+                # if fps low, cap to fewer spans (largest first)
+                cap = int(1800 * self._quality)
+                if cap < len(self.spans):
+                    spans = sorted(self.spans, key=lambda s: s.dur, reverse=True)[:cap]
+                else:
+                    spans = self.spans
 
-        for s in spans:
-            rect, _ = self._span_rect(s)
-            if rect.right() < -40 or rect.left() > self.width() + 40:
-                continue
-            # color
-            c = _qcolor(self._cat_colors.get(s.category, self.theme["accent"]))
-            if self.search and self.search in s.name.lower():
-                c = _blend(c, _qcolor(self.theme["accent"]), 0.35)
+                painter.setFont(QFont("Segoe UI", 8))
+                fm = QFontMetrics(painter.font())
 
-            p.setBrush(c)
-            p.setPen(QPen(_qcolor(self.theme["stroke"]), 1))
-            p.drawRoundedRect(rect, 5, 5)
+                for s in spans:
+                    rect, _ = self._span_rect(s)
+                    if rect.right() < -40 or rect.left() > self.width() + 40:
+                        continue
+                    # color
+                    c = _qcolor(self._cat_colors.get(s.category, self.theme["accent"]))
+                    if self.search and self.search in s.name.lower():
+                        c = _blend(c, _qcolor(self.theme["accent"]), 0.35)
 
-            if s.span_id == self.selected:
-                p.setPen(QPen(_qcolor(self.theme["accent2"]), 2))
-                p.setBrush(Qt.NoBrush)
-                p.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 5, 5)
-            elif s.span_id == self.hovered:
-                p.setPen(QPen(_qcolor(self.theme["accent"]), 2))
-                p.setBrush(Qt.NoBrush)
-                p.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 5, 5)
+                    painter.setBrush(c)
+                    painter.setPen(QPen(_qcolor(self.theme["stroke"]), 1))
+                    painter.drawRoundedRect(rect, 5, 5)
 
-            # label
-            if rect.width() > 70 and self._quality > 0.55:
-                label = s.name
-                maxw = rect.width() - 10
-                if fm.horizontalAdvance(label) > maxw:
-                    ell = "…"
-                    while label and fm.horizontalAdvance(label + ell) > maxw:
-                        label = label[:-1]
-                    label = (label + ell) if label else ell
-                p.setPen(_qcolor(self.theme["text"]))
-                p.drawText(rect.adjusted(7, 0, -7, 0), Qt.AlignVCenter | Qt.AlignLeft, label)
+                    if s.span_id == self.selected:
+                        painter.setPen(QPen(_qcolor(self.theme["accent2"]), 2))
+                        painter.setBrush(Qt.NoBrush)
+                        painter.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 5, 5)
+                    elif s.span_id == self.hovered:
+                        painter.setPen(QPen(_qcolor(self.theme["accent"]), 2))
+                        painter.setBrush(Qt.NoBrush)
+                        painter.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 5, 5)
 
-        # brush selection overlay
-        if self._brush:
-            a, b = self._brush
-            x1 = self._t_to_x(min(a, b))
-            x2 = self._t_to_x(max(a, b))
-            p.setPen(Qt.NoPen)
-            overlay = _qcolor(self.theme["accent"])
-            overlay.setAlpha(60)
-            p.setBrush(overlay)
-            p.drawRect(QRectF(x1, self.header_h, x2 - x1, self.height() - self.header_h))
+                    # label
+                    if rect.width() > 70 and self._quality > 0.55:
+                        label = s.name
+                        maxw = rect.width() - 10
+                        if fm.horizontalAdvance(label) > maxw:
+                            ell = "…"
+                            while label and fm.horizontalAdvance(label + ell) > maxw:
+                                label = label[:-1]
+                            label = (label + ell) if label else ell
+                        painter.setPen(_qcolor(self.theme["text"]))
+                        painter.drawText(rect.adjusted(7, 0, -7, 0), Qt.AlignVCenter | Qt.AlignLeft, label)
+
+                # brush selection overlay
+                if self._brush:
+                    a, b = self._brush
+                    x1 = self._t_to_x(min(a, b))
+                    x2 = self._t_to_x(max(a, b))
+                    painter.setPen(Qt.NoPen)
+                    overlay = _qcolor(self.theme["accent"])
+                    overlay.setAlpha(60)
+                    painter.setBrush(overlay)
+                    painter.drawRect(QRectF(x1, self.header_h, x2 - x1, self.height() - self.header_h))
+        finally:
+            painter.end()
+        if not has_spans:
+            return
 
         # fps / quality adjust
         self._fps_counter += 1
@@ -1320,105 +1378,109 @@ class MemoryHeatmapWidget(QWidget):
         self.throttle.poke()
 
     def paintEvent(self, e) -> None:
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing, True)
-        p.fillRect(self.rect(), _qcolor(self.theme["panel2"]))
-
-        p.setFont(QFont("Segoe UI", 9))
-        p.setPen(_qcolor(self.theme["muted"]))
-        p.drawText(12, 22, "Memory • tracemalloc checkpoints • heatmap of top alloc sites (size, by time)")
-
-        if not self.points:
-            p.setPen(_qcolor(self.theme["muted"]))
-            p.setFont(QFont("Segoe UI", 10))
-            p.drawText(self.rect().adjusted(0, 30, 0, 0), Qt.AlignCenter, "No memory checkpoints yet")
+        painter = QPainter()
+        if not painter.begin(self):
             return
+        try:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            painter.fillRect(self.rect(), _qcolor(self.theme["panel2"]))
 
-        cols = min(len(self.points), max(1, int((self.width() - 20) / self.cell)))
-        # rows based on top alloc sites
-        rows = 0
-        for pt in self.points[:cols]:
-            rows = max(rows, len(pt.top))
-        rows = min(rows, max(1, int((self.height() - 80) / self.cell)))
+            painter.setFont(QFont("Segoe UI", 9))
+            painter.setPen(_qcolor(self.theme["muted"]))
+            painter.drawText(12, 22, "Memory • tracemalloc checkpoints • heatmap of top alloc sites (size, by time)")
 
-        # peak for line
-        peak = max(pt.peak for pt in self.points) if self.points else 1
-
-        # max site size for heat intensity
-        max_site = 1
-        for pt in self.points[:cols]:
-            for s in pt.top[:rows]:
-                max_site = max(max_site, int(s.get("size", 0)))
-
-        # legend chips
-        def chip(x: int, y: int, label: str, color: str) -> None:
-            p.setPen(Qt.NoPen)
-            p.setBrush(_qcolor(color))
-            p.drawRoundedRect(x, y, 12, 12, 4, 4)
-            p.setPen(_qcolor(self.theme["muted"]))
-            p.drawText(x + 16, y + 11, label)
-
-        chip(self.width() - 170, 10, "Low", self.theme["good"])
-        chip(self.width() - 110, 10, "Mid", self.theme["warn"])
-        chip(self.width() - 50, 10, "High", self.theme["bad"])
-
-        base_x = 12
-        base_y = 42
-
-        for c in range(cols):
-            pt = self.points[c]
-            for r in range(min(rows, len(pt.top))):
-                site = pt.top[r]
-                size = int(site.get("size", 0))
-                intensity = size / max_site
-                if intensity < 0.33:
-                    col = _qcolor(self.theme["good"])
-                elif intensity < 0.66:
-                    col = _qcolor(self.theme["warn"])
-                else:
-                    col = _qcolor(self.theme["bad"])
-                rect = QRectF(base_x + c * self.cell, base_y + r * self.cell, self.cell - 2, self.cell - 2)
-                p.setPen(Qt.NoPen)
-                p.setBrush(col)
-                p.drawRoundedRect(rect, 4, 4)
-                if self.hover == (c, r):
-                    p.setPen(QPen(_qcolor(self.theme["accent"]), 2))
-                    p.setBrush(Qt.NoBrush)
-                    p.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 4, 4)
-
-        # memory line chart under heatmap
-        chart_top = base_y + rows * self.cell + 12
-        chart_h = max(40, self.height() - chart_top - 10)
-        p.setPen(QPen(_qcolor(self.theme["accent"]), 2))
-        path = QPainterPath()
-        for i in range(cols):
-            pt = self.points[i]
-            x = base_x + i * self.cell + (self.cell / 2)
-            y = chart_top + (1.0 - pt.current / max(1, peak)) * (chart_h - 8) + 4
-            if i == 0:
-                path.moveTo(x, y)
+            if not self.points:
+                painter.setPen(_qcolor(self.theme["muted"]))
+                painter.setFont(QFont("Segoe UI", 10))
+                painter.drawText(self.rect().adjusted(0, 30, 0, 0), Qt.AlignCenter, "No memory checkpoints yet")
             else:
-                path.lineTo(x, y)
-        p.drawPath(path)
+                cols = min(len(self.points), max(1, int((self.width() - 20) / self.cell)))
+                # rows based on top alloc sites
+                rows = 0
+                for pt in self.points[:cols]:
+                    rows = max(rows, len(pt.top))
+                rows = min(rows, max(1, int((self.height() - 80) / self.cell)))
 
-        p.setPen(_qcolor(self.theme["muted"]))
-        p.setFont(QFont("Segoe UI", 8))
-        p.drawText(base_x, chart_top + chart_h - 2, f"Peak { _human_bytes(peak) }")
+                # peak for line
+                peak = max(pt.peak for pt in self.points) if self.points else 1
 
-        # labels for columns (checkpoint names)
-        for i in range(cols):
-            pt = self.points[i]
-            if not pt.label:
-                continue
-            lbl = pt.label
-            if len(lbl) > 18:
-                lbl = lbl[:17] + "…"
-            p.save()
-            p.translate(base_x + i * self.cell + 6, base_y - 4)
-            p.rotate(-50)
-            p.setPen(_qcolor(self.theme["muted"]))
-            p.drawText(0, 0, lbl)
-            p.restore()
+                # max site size for heat intensity
+                max_site = 1
+                for pt in self.points[:cols]:
+                    for s in pt.top[:rows]:
+                        max_site = max(max_site, int(s.get("size", 0)))
+
+                # legend chips
+                def chip(x: int, y: int, label: str, color: str) -> None:
+                    painter.setPen(Qt.NoPen)
+                    painter.setBrush(_qcolor(color))
+                    painter.drawRoundedRect(x, y, 12, 12, 4, 4)
+                    painter.setPen(_qcolor(self.theme["muted"]))
+                    painter.drawText(x + 16, y + 11, label)
+
+                chip(self.width() - 170, 10, "Low", self.theme["good"])
+                chip(self.width() - 110, 10, "Mid", self.theme["warn"])
+                chip(self.width() - 50, 10, "High", self.theme["bad"])
+
+                base_x = 12
+                base_y = 42
+
+                for c in range(cols):
+                    pt = self.points[c]
+                    for r in range(min(rows, len(pt.top))):
+                        site = pt.top[r]
+                        size = int(site.get("size", 0))
+                        intensity = size / max_site
+                        if intensity < 0.33:
+                            col = _qcolor(self.theme["good"])
+                        elif intensity < 0.66:
+                            col = _qcolor(self.theme["warn"])
+                        else:
+                            col = _qcolor(self.theme["bad"])
+                        rect = QRectF(base_x + c * self.cell, base_y + r * self.cell, self.cell - 2, self.cell - 2)
+                        painter.setPen(Qt.NoPen)
+                        painter.setBrush(col)
+                        painter.drawRoundedRect(rect, 4, 4)
+                        if self.hover == (c, r):
+                            painter.setPen(QPen(_qcolor(self.theme["accent"]), 2))
+                            painter.setBrush(Qt.NoBrush)
+                            painter.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 4, 4)
+
+                # memory line chart under heatmap
+                chart_top = base_y + rows * self.cell + 12
+                chart_h = max(40, self.height() - chart_top - 10)
+                painter.setPen(QPen(_qcolor(self.theme["accent"]), 2))
+                path = QPainterPath()
+                for i in range(cols):
+                    pt = self.points[i]
+                    x = base_x + i * self.cell + (self.cell / 2)
+                    y = chart_top + (1.0 - pt.current / max(1, peak)) * (chart_h - 8) + 4
+                    if i == 0:
+                        path.moveTo(x, y)
+                    else:
+                        path.lineTo(x, y)
+                painter.drawPath(path)
+
+                painter.setPen(_qcolor(self.theme["muted"]))
+                painter.setFont(QFont("Segoe UI", 8))
+                painter.drawText(base_x, chart_top + chart_h - 2, f"Peak { _human_bytes(peak) }")
+
+                # labels for columns (checkpoint names)
+                for i in range(cols):
+                    pt = self.points[i]
+                    if not pt.label:
+                        continue
+                    lbl = pt.label
+                    if len(lbl) > 18:
+                        lbl = lbl[:17] + "…"
+                    painter.save()
+                    painter.translate(base_x + i * self.cell + 6, base_y - 4)
+                    painter.rotate(-50)
+                    painter.setPen(_qcolor(self.theme["muted"]))
+                    painter.drawText(0, 0, lbl)
+                    painter.restore()
+        finally:
+            painter.end()
 
     def mouseMoveEvent(self, e) -> None:
         if not self.points:
@@ -1509,74 +1571,78 @@ class CallGraphWidget(QWidget):
         super().resizeEvent(e)
 
     def paintEvent(self, e) -> None:
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing, True)
-        p.fillRect(self.rect(), _qcolor(self.theme["panel2"]))
-        p.setFont(QFont("Segoe UI", 9))
-        p.setPen(_qcolor(self.theme["muted"]))
-        p.drawText(12, 22, "Call Graph • nodes are functions • edges are “calls” inferred from stacks (weighted by time)")
-
-        if not self.nodes:
-            p.setPen(_qcolor(self.theme["muted"]))
-            p.setFont(QFont("Segoe UI", 10))
-            p.drawText(self.rect().adjusted(0, 30, 0, 0), Qt.AlignCenter, "No call graph yet")
+        painter = QPainter()
+        if not painter.begin(self):
             return
+        try:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            painter.fillRect(self.rect(), _qcolor(self.theme["panel2"]))
+            painter.setFont(QFont("Segoe UI", 9))
+            painter.setPen(_qcolor(self.theme["muted"]))
+            painter.drawText(12, 22, "Call Graph • nodes are functions • edges are “calls” inferred from stacks (weighted by time)")
 
-        # edge thickness normalization
-        maxw = max((e.weight for e in self.edges), default=1e-9)
-        # draw edges
-        for e1 in self.edges:
-            if e1.src not in self.pos or e1.dst not in self.pos:
-                continue
-            a = self.pos[e1.src]
-            b = self.pos[e1.dst]
-            t = (e1.weight / maxw)
-            thick = 1.0 + t * 5.0
-            col = _blend(_qcolor(self.theme["grid"]), _qcolor(self.theme["accent"]), min(1.0, 0.2 + t))
-            if self.hover_edge == (e1.src, e1.dst):
-                col = _qcolor(self.theme["accent2"])
-                thick = max(2.0, thick + 1.5)
-            p.setPen(QPen(col, thick))
-            p.drawLine(a, b)
-            # arrow head
-            dx, dy = (b.x() - a.x()), (b.y() - a.y())
-            L = (dx * dx + dy * dy) ** 0.5
-            if L > 1e-6:
-                ux, uy = dx / L, dy / L
-                px, py = -uy, ux
-                tip = QPointF(b.x() - ux * 16, b.y() - uy * 16)
-                left = QPointF(tip.x() - ux * 2 + px * 6, tip.y() - uy * 2 + py * 6)
-                right = QPointF(tip.x() - ux * 2 - px * 6, tip.y() - uy * 2 - py * 6)
-                p.setBrush(col)
-                p.setPen(Qt.NoPen)
-                p.drawPolygon([b, left, right])
+            if not self.nodes:
+                painter.setPen(_qcolor(self.theme["muted"]))
+                painter.setFont(QFont("Segoe UI", 10))
+                painter.drawText(self.rect().adjusted(0, 30, 0, 0), Qt.AlignCenter, "No call graph yet")
+            else:
+                # edge thickness normalization
+                maxw = max((e.weight for e in self.edges), default=1e-9)
+                # draw edges
+                for e1 in self.edges:
+                    if e1.src not in self.pos or e1.dst not in self.pos:
+                        continue
+                    a = self.pos[e1.src]
+                    b = self.pos[e1.dst]
+                    t = (e1.weight / maxw)
+                    thick = 1.0 + t * 5.0
+                    col = _blend(_qcolor(self.theme["grid"]), _qcolor(self.theme["accent"]), min(1.0, 0.2 + t))
+                    if self.hover_edge == (e1.src, e1.dst):
+                        col = _qcolor(self.theme["accent2"])
+                        thick = max(2.0, thick + 1.5)
+                    painter.setPen(QPen(col, thick))
+                    painter.drawLine(a, b)
+                    # arrow head
+                    dx, dy = (b.x() - a.x()), (b.y() - a.y())
+                    L = (dx * dx + dy * dy) ** 0.5
+                    if L > 1e-6:
+                        ux, uy = dx / L, dy / L
+                        px, py = -uy, ux
+                        tip = QPointF(b.x() - ux * 16, b.y() - uy * 16)
+                        left = QPointF(tip.x() - ux * 2 + px * 6, tip.y() - uy * 2 + py * 6)
+                        right = QPointF(tip.x() - ux * 2 - px * 6, tip.y() - uy * 2 - py * 6)
+                        painter.setBrush(col)
+                        painter.setPen(Qt.NoPen)
+                        painter.drawPolygon([b, left, right])
 
-        # draw nodes
-        p.setFont(QFont("Segoe UI", 8))
-        fm = QFontMetrics(p.font())
-        for n in self.nodes:
-            pt = self.pos.get(n)
-            if not pt:
-                continue
-            rad = 16
-            rect = QRectF(pt.x() - rad, pt.y() - rad, rad * 2, rad * 2)
-            base = _qcolor(self.theme["accent"])
-            fill = _blend(base, _qcolor(self.theme["chip"]), 0.35)
-            if n == self.selected_node:
-                fill = _qcolor(self.theme["accent2"])
-            elif n == self.hover_node:
-                fill = _blend(_qcolor(self.theme["accent2"]), fill, 0.3)
+                # draw nodes
+                painter.setFont(QFont("Segoe UI", 8))
+                fm = QFontMetrics(painter.font())
+                for n in self.nodes:
+                    pt = self.pos.get(n)
+                    if not pt:
+                        continue
+                    rad = 16
+                    rect = QRectF(pt.x() - rad, pt.y() - rad, rad * 2, rad * 2)
+                    base = _qcolor(self.theme["accent"])
+                    fill = _blend(base, _qcolor(self.theme["chip"]), 0.35)
+                    if n == self.selected_node:
+                        fill = _qcolor(self.theme["accent2"])
+                    elif n == self.hover_node:
+                        fill = _blend(_qcolor(self.theme["accent2"]), fill, 0.3)
 
-            p.setPen(QPen(_qcolor(self.theme["stroke"]), 1))
-            p.setBrush(fill)
-            p.drawEllipse(rect)
+                    painter.setPen(QPen(_qcolor(self.theme["stroke"]), 1))
+                    painter.setBrush(fill)
+                    painter.drawEllipse(rect)
 
-            label = n
-            if len(label) > 16:
-                label = label[:15] + "…"
-            tw = fm.horizontalAdvance(label)
-            p.setPen(_qcolor(self.theme["text"]))
-            p.drawText(int(pt.x() - tw / 2), int(pt.y() + rad + 14), label)
+                    label = n
+                    if len(label) > 16:
+                        label = label[:15] + "…"
+                    tw = fm.horizontalAdvance(label)
+                    painter.setPen(_qcolor(self.theme["text"]))
+                    painter.drawText(int(pt.x() - tw / 2), int(pt.y() + rad + 14), label)
+        finally:
+            painter.end()
 
     def _hit_node(self, pos: QPointF) -> Optional[str]:
         for n in self.nodes:
@@ -3592,6 +3658,18 @@ class MainWindow(QMainWindow):
         # disable risky actions during run
         for a in [self.act_demo, self.act_demo_opt, self.act_profile_script, self.act_profile_func, self.act_save, self.act_export, self.act_deep_trace]:
             a.setEnabled(not running)
+
+    def closeEvent(self, event: QEvent) -> None:
+        self._shutdown_workers()
+        super().closeEvent(event)
+
+    def _shutdown_workers(self) -> None:
+        if self._thread and self._thread.isRunning():
+            self.profiler.cancel()
+            self._thread.quit()
+            self._thread.wait(3000)
+        self._thread = None
+        self._worker = None
 
     def _add_session(self, sess: ProfileSession) -> None:
         self.sessions.insert(0, sess)
